@@ -52,6 +52,37 @@ class GhostfolioAssetResolutionTests(unittest.TestCase):
         self.assertEqual(resolved["dataSource"], "COINGECKO")
         self.assertEqual(resolved["symbol"], "sui")
 
+    def test_dry_run_accepts_exact_hyperliquid_provider_identity(self):
+        activity = {"dataSource": "COINGECKO", "symbol": "hyperliquid"}
+        response = {
+            "activities": [{
+                "error": None,
+                "SymbolProfile": {
+                    "dataSource": "COINGECKO",
+                    "symbol": "hyperliquid",
+                    "name": "Hyperliquid",
+                },
+            }]
+        }
+
+        portfolio_logger.validate_ghostfolio_resolution(activity, response)
+
+    def test_dry_run_rejects_provider_resolution_mismatch(self):
+        activity = {"dataSource": "COINGECKO", "symbol": "hyperliquid"}
+        response = {
+            "activities": [{
+                "error": None,
+                "SymbolProfile": {
+                    "dataSource": "YAHOO",
+                    "symbol": "HYPEUSD",
+                    "name": "Supreme Finance USD",
+                },
+            }]
+        }
+
+        with self.assertRaisesRegex(ValueError, "asset resolution mismatch"):
+            portfolio_logger.validate_ghostfolio_resolution(activity, response)
+
 
 if __name__ == "__main__":
     unittest.main()

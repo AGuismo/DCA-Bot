@@ -164,6 +164,38 @@ def build_ghostfolio_activity(trade_data, symbol, account_id, exchange_pair=None
     }
 
 
+def validate_ghostfolio_resolution(activity, dry_run_response):
+    """Ensure Ghostfolio resolved the exact provider identity we requested."""
+    activities = dry_run_response.get("activities", [])
+    if len(activities) != 1:
+        raise ValueError(
+            f"Ghostfolio dry run returned {len(activities)} activities; expected 1"
+        )
+
+    result = activities[0]
+    if result.get("error"):
+        raise ValueError(f"Ghostfolio asset resolution failed: {result['error']}")
+
+    profile = result.get("SymbolProfile") or {}
+    selected_data_source = profile.get("dataSource")
+    selected_symbol = profile.get("symbol")
+    print(
+        "   Ghostfolio dry-run selection: "
+        f"data_source={selected_data_source}, "
+        f"provider_identifier={selected_symbol}, name={profile.get('name')}"
+    )
+
+    if (
+        selected_data_source != activity["dataSource"]
+        or selected_symbol != activity["symbol"]
+    ):
+        raise ValueError(
+            "Ghostfolio asset resolution mismatch: "
+            f"requested {activity['dataSource']}/{activity['symbol']}, "
+            f"selected {selected_data_source}/{selected_symbol}"
+        )
+
+
 def log_to_ghostfolio(trade_data, symbol, account_id, exchange_pair=None):
     """
     Log a trade to Ghostfolio portfolio.
@@ -211,6 +243,19 @@ def log_to_ghostfolio(trade_data, symbol, account_id, exchange_pair=None):
             "Content-Type": "application/json"
         }
         payload = {"activities": [activity]}
+
+        # Validate Ghostfolio's own provider resolution before creating anything.
+        # A mismatch fails closed instead of saving an activity under a wrong asset.
+        dry_run = requests.post(
+            f"{url}?dryRun=true", headers=headers, json=payload, timeout=30
+        )
+        if dry_run.status_code != 201:
+            print(
+                f"❌ Ghostfolio asset-resolution dry run failed "
+                f"({dry_run.status_code}): {dry_run.text}"
+            )
+            return False
+        validate_ghostfolio_resolution(activity, dry_run.json())
         
         for attempt in range(1, 4):
             try:
