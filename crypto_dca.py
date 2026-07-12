@@ -333,7 +333,9 @@ def execute_trade(symbol, amount_thb, map_key=None, target_map=None):
                     "usd_price_per_unit": usd_price_per_unit
                 }
                 
-                ghostfolio_saved = log_to_ghostfolio(ghostfolio_data, base_sym, account_id)
+                ghostfolio_saved = log_to_ghostfolio(
+                    ghostfolio_data, base_sym, account_id, exchange_pair=symbol
+                )
                 
                 if ghostfolio_saved:
                     print(f"✅ Logged to Ghostfolio account {account_id}")

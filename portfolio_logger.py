@@ -14,8 +14,13 @@ PORTFOLIO_ACCOUNT_MAP_JSON = os.environ.get("PORTFOLIO_ACCOUNT_MAP", "{}")
 # dataSource + symbol pair that Ghostfolio should use instead.
 # COINGECKO symbols are the CoinGecko coin ID (lowercase).
 SYMBOL_DATASOURCE_OVERRIDES = {
+    "HYPE": {"dataSource": "COINGECKO", "symbol": "hyperliquid"},
     "SUI": {"dataSource": "COINGECKO", "symbol": "sui"},
 }
+
+# These tickers are known to identify more than one asset. They must never use
+# the conventional Yahoo {ticker}USD fallback without an explicit mapping.
+AMBIGUOUS_SYMBOLS = {"HYPE"}
 
 # Timezone Configuration
 TIMEZONE_NAME = os.environ.get("TIMEZONE", "Asia/Bangkok")
@@ -97,7 +102,69 @@ def authenticate_ghostfolio(base_url, access_token, timeout=30, retries=3, delay
     print(f"❌ Ghostfolio authentication failed after {retries} attempts")
     return None
 
-def log_to_ghostfolio(trade_data, symbol, account_id):
+
+def resolve_ghostfolio_asset(symbol, exchange_pair=None):
+    """Resolve a base ticker to the exact identity expected by Ghostfolio."""
+    base_symbol = symbol.strip().upper()
+    override = SYMBOL_DATASOURCE_OVERRIDES.get(base_symbol)
+
+    if override:
+        resolution = {
+            "dataSource": override["dataSource"],
+            "symbol": override["symbol"],
+            "providerIdentifier": override["symbol"],
+            "usedExplicitMapping": True,
+        }
+    elif base_symbol in AMBIGUOUS_SYMBOLS:
+        raise ValueError(
+            f"Ambiguous Ghostfolio asset ticker {base_symbol} has no explicit mapping"
+        )
+    else:
+        yahoo_symbol = f"{base_symbol}USD"
+        resolution = {
+            "dataSource": "YAHOO",
+            "symbol": yahoo_symbol,
+            "providerIdentifier": yahoo_symbol,
+            "usedExplicitMapping": False,
+        }
+
+    print(
+        "   Ghostfolio asset resolution: "
+        f"pair={exchange_pair or 'unknown'}, base={base_symbol}, "
+        f"requested_symbol={resolution['symbol']}, "
+        f"data_source={resolution['dataSource']}, "
+        f"provider_identifier={resolution['providerIdentifier']}, "
+        f"method={'explicit_mapping' if resolution['usedExplicitMapping'] else 'fallback'}"
+    )
+    return resolution
+
+
+def build_ghostfolio_activity(trade_data, symbol, account_id, exchange_pair=None):
+    """Build an import activity after resolving its provider-specific asset."""
+    ts = trade_data["ts"]
+    dt = datetime.fromtimestamp(ts, tz=SELECTED_TZ)
+    date_str = dt.astimezone(dt_timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+    quantity = float(f"{trade_data['amount_crypto']:.8f}")
+    resolution = resolve_ghostfolio_asset(symbol, exchange_pair=exchange_pair)
+
+    return {
+        "accountId": account_id,
+        "comment": (
+            f"฿{trade_data['amount_thb']:.2f} - ${trade_data['amount_usd']:.2f} - "
+            f"{trade_data['order_id']}"
+        ),
+        "currency": "USD",
+        "dataSource": resolution["dataSource"],
+        "date": date_str,
+        "fee": 0,
+        "quantity": quantity,
+        "symbol": resolution["symbol"],
+        "type": "BUY",
+        "unitPrice": round(trade_data["usd_price_per_unit"], 4),
+    }
+
+
+def log_to_ghostfolio(trade_data, symbol, account_id, exchange_pair=None):
     """
     Log a trade to Ghostfolio portfolio.
     
@@ -112,6 +179,7 @@ def log_to_ghostfolio(trade_data, symbol, account_id):
             - usd_price_per_unit: Price per 1 full coin in USD
         symbol: Base crypto symbol (e.g., "BTC", "LINK")
         account_id: Ghostfolio account UUID
+        exchange_pair: Input exchange pair for resolution logging (e.g., "HYPE_THB")
     
     Returns:
         True on success, False on failure
@@ -130,44 +198,11 @@ def log_to_ghostfolio(trade_data, symbol, account_id):
         if not bearer_token:
             return False
         
-        # 2. Format date in ISO-8601 with timezone
-        ts = trade_data['ts']
-        dt = datetime.fromtimestamp(ts, tz=SELECTED_TZ)
-        # Convert to UTC for Ghostfolio
-        dt_utc = dt.astimezone(dt_timezone.utc)
-        date_str = dt_utc.strftime("%Y-%m-%dT%H:%M:%S.000Z")
-        
-        # 3. Format comment with Thai and USD amounts
-        thb_spent = trade_data['amount_thb']
-        usd_spent = trade_data['amount_usd']
-        comment = f"฿{thb_spent:.2f} - ${usd_spent:.2f} - {trade_data['order_id']}"
-        
-        # 4. Format quantity to 8 decimals
-        quantity = float(f"{trade_data['amount_crypto']:.8f}")
-        
-        # 5. Build activity — use datasource/symbol override if Yahoo Finance
-        # doesn't carry this coin correctly (e.g. SUIUSD maps to "Salmonation").
-        override = SYMBOL_DATASOURCE_OVERRIDES.get(symbol)
-        if override:
-            gf_datasource = override["dataSource"]
-            gf_symbol = override["symbol"]
-            print(f"   Using override for {symbol}: {gf_datasource}/{gf_symbol}")
-        else:
-            gf_datasource = "YAHOO"
-            gf_symbol = f"{symbol}USD"  # e.g., BTCUSD, LINKUSD
-
-        activity = {
-            "accountId": account_id,
-            "comment": comment,
-            "currency": "USD",
-            "dataSource": gf_datasource,
-            "date": date_str,
-            "fee": 0,
-            "quantity": quantity,
-            "symbol": gf_symbol,
-            "type": "BUY",
-            "unitPrice": round(trade_data['usd_price_per_unit'], 4)
-        }
+        # 2. Resolve the provider-specific asset and build the import payload.
+        activity = build_ghostfolio_activity(
+            trade_data, symbol, account_id, exchange_pair=exchange_pair
+        )
+        quantity = activity["quantity"]
         
         # 6. Import to Ghostfolio (with retry for transient errors)
         url = f"{GHOSTFOLIO_URL}/api/v1/import"
