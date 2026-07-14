@@ -22,6 +22,10 @@ SYMBOL_DATASOURCE_OVERRIDES = {
 # the conventional Yahoo {ticker}USD fallback without an explicit mapping.
 AMBIGUOUS_SYMBOLS = {"HYPE"}
 
+IMPORT_RETRY_ATTEMPTS = 3
+IMPORT_RETRY_DELAY_SECONDS = 2
+RETRYABLE_IMPORT_STATUS_CODES = {408, 425, 429}
+
 # Timezone Configuration
 TIMEZONE_NAME = os.environ.get("TIMEZONE", "Asia/Bangkok")
 from zoneinfo import ZoneInfo
@@ -164,6 +168,86 @@ def build_ghostfolio_activity(trade_data, symbol, account_id, exchange_pair=None
     }
 
 
+def _safe_response_body(response, redacted_values=()):
+    """Return a bounded API response body without exposing the access token."""
+    body = response.text[:1000]
+    for value in (GHOSTFOLIO_TOKEN, *redacted_values):
+        if value:
+            body = body.replace(value, "[redacted]")
+    return body
+
+
+def _response_messages(response):
+    """Extract Ghostfolio error messages when the response is JSON."""
+    try:
+        response_data = response.json()
+    except ValueError:
+        return []
+
+    messages = response_data.get("message", [])
+    if isinstance(messages, str):
+        return [messages]
+    if isinstance(messages, list):
+        return [str(message) for message in messages]
+    return []
+
+
+def _is_retryable_import_response(response):
+    """Identify transient Ghostfolio failures, including masked provider outages."""
+    if response.status_code in RETRYABLE_IMPORT_STATUS_CODES:
+        return True
+    if response.status_code >= 500:
+        return True
+    if response.status_code != 400:
+        return False
+
+    return any(
+        "is not valid for the specified data source" in message.lower()
+        for message in _response_messages(response)
+    )
+
+
+def _post_import(url, headers, payload, stage):
+    """Post an import request with bounded retries for transient failures."""
+    for attempt in range(1, IMPORT_RETRY_ATTEMPTS + 1):
+        try:
+            response = requests.post(url, headers=headers, json=payload, timeout=30)
+        except (
+            requests.exceptions.Timeout,
+            requests.exceptions.ConnectionError,
+            requests.exceptions.SSLError,
+        ) as error:
+            retryable = True
+            failure = f"request error: {error}"
+        else:
+            if response.status_code == 201:
+                return response
+
+            retryable = _is_retryable_import_response(response)
+            failure = (
+                f"HTTP {response.status_code}: "
+                f"{_safe_response_body(response, [headers.get('Authorization')])}"
+            )
+
+            if not retryable:
+                print(f"❌ Ghostfolio {stage} failed ({failure})")
+                return response
+
+        print(
+            f"⚠️ Ghostfolio {stage} failed "
+            f"(attempt {attempt}/{IMPORT_RETRY_ATTEMPTS}; {failure})"
+        )
+        if retryable and attempt < IMPORT_RETRY_ATTEMPTS:
+            print(f"   Retrying in {IMPORT_RETRY_DELAY_SECONDS}s...")
+            time.sleep(IMPORT_RETRY_DELAY_SECONDS)
+
+    print(
+        f"❌ Ghostfolio {stage} failed after "
+        f"{IMPORT_RETRY_ATTEMPTS} attempts: {failure}"
+    )
+    return None
+
+
 def validate_ghostfolio_resolution(activity, dry_run_response):
     """Ensure Ghostfolio resolved the exact provider identity we requested."""
     activities = dry_run_response.get("activities", [])
@@ -173,8 +257,14 @@ def validate_ghostfolio_resolution(activity, dry_run_response):
         )
 
     result = activities[0]
-    if result.get("error"):
-        raise ValueError(f"Ghostfolio asset resolution failed: {result['error']}")
+    result_error = result.get("error")
+    if result_error:
+        if (
+            isinstance(result_error, dict)
+            and result_error.get("code") == "IS_DUPLICATE"
+        ):
+            return "duplicate"
+        raise ValueError(f"Ghostfolio asset resolution failed: {result_error}")
 
     profile = result.get("SymbolProfile") or {}
     selected_data_source = profile.get("dataSource")
@@ -195,8 +285,12 @@ def validate_ghostfolio_resolution(activity, dry_run_response):
             f"selected {selected_data_source}/{selected_symbol}"
         )
 
+    return "valid"
 
-def log_to_ghostfolio(trade_data, symbol, account_id, exchange_pair=None):
+
+def log_to_ghostfolio(
+    trade_data, symbol, account_id, exchange_pair=None, bearer_token=None
+):
     """
     Log a trade to Ghostfolio portfolio.
     
@@ -212,11 +306,12 @@ def log_to_ghostfolio(trade_data, symbol, account_id, exchange_pair=None):
         symbol: Base crypto symbol (e.g., "BTC", "LINK")
         account_id: Ghostfolio account UUID
         exchange_pair: Input exchange pair for resolution logging (e.g., "HYPE_THB")
+        bearer_token: Existing Ghostfolio session token for a recovery job
     
     Returns:
         True on success, False on failure
     """
-    if not GHOSTFOLIO_TOKEN:
+    if not GHOSTFOLIO_TOKEN and not bearer_token:
         print("⚠️ GHOSTFOLIO_TOKEN not set. Skipping Ghostfolio logging.")
         return False
     
@@ -226,9 +321,12 @@ def log_to_ghostfolio(trade_data, symbol, account_id, exchange_pair=None):
     
     try:
         # 1. Authenticate
-        bearer_token = authenticate_ghostfolio(GHOSTFOLIO_URL, GHOSTFOLIO_TOKEN, timeout=30)
         if not bearer_token:
-            return False
+            bearer_token = authenticate_ghostfolio(
+                GHOSTFOLIO_URL, GHOSTFOLIO_TOKEN, timeout=30
+            )
+            if not bearer_token:
+                return False
         
         # 2. Resolve the provider-specific asset and build the import payload.
         activity = build_ghostfolio_activity(
@@ -246,39 +344,36 @@ def log_to_ghostfolio(trade_data, symbol, account_id, exchange_pair=None):
 
         # Validate Ghostfolio's own provider resolution before creating anything.
         # A mismatch fails closed instead of saving an activity under a wrong asset.
-        dry_run = requests.post(
-            f"{url}?dryRun=true", headers=headers, json=payload, timeout=30
+        dry_run = _post_import(
+            f"{url}?dryRun=true", headers, payload, "asset-resolution dry run"
         )
-        if dry_run.status_code != 201:
+        if dry_run is None or dry_run.status_code != 201:
+            return False
+        dry_run_state = validate_ghostfolio_resolution(activity, dry_run.json())
+        if dry_run_state == "duplicate":
             print(
-                f"❌ Ghostfolio asset-resolution dry run failed "
-                f"({dry_run.status_code}): {dry_run.text}"
+                f"✅ Ghostfolio activity already exists: "
+                f"{quantity:.8f} {symbol} @ ${activity['unitPrice']:.4f}"
+            )
+            return True
+
+        response = _post_import(url, headers, payload, "import")
+        if response is None or response.status_code != 201:
+            return False
+
+        import_state = validate_ghostfolio_resolution(activity, response.json())
+        if import_state != "valid":
+            print(
+                "❌ Ghostfolio import returned a duplicate activity after a "
+                "valid dry run; reconcile it by exchange order ID"
             )
             return False
-        validate_ghostfolio_resolution(activity, dry_run.json())
-        
-        for attempt in range(1, 4):
-            try:
-                r = requests.post(url, headers=headers, json=payload, timeout=30)
-                
-                if r.status_code == 201:
-                    print(f"✅ Successfully logged to Ghostfolio: {quantity:.8f} {symbol} @ ${activity['unitPrice']:.4f}")
-                    return True
-                else:
-                    print(f"❌ Ghostfolio import failed ({r.status_code}): {r.text}")
-                    return False
-                    
-            except (requests.exceptions.Timeout, requests.exceptions.ConnectionError, requests.exceptions.SSLError) as e:
-                print(f"⚠️ Ghostfolio import error (attempt {attempt}/3): {e}")
-                if attempt < 3:
-                    print(f"   Retrying in 2s...")
-                    time.sleep(2)
-            except Exception as e:
-                print(f"❌ Ghostfolio logging error: {e}")
-                return False
-        
-        print(f"❌ Ghostfolio import failed after 3 attempts")
-        return False
+
+        print(
+            f"✅ Successfully logged to Ghostfolio: "
+            f"{quantity:.8f} {symbol} @ ${activity['unitPrice']:.4f}"
+        )
+        return True
     
     except Exception as e:
         print(f"❌ Ghostfolio logging error: {e}")
