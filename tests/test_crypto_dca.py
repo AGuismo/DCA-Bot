@@ -35,16 +35,14 @@ class DcaGhostfolioBoundaryTests(unittest.TestCase):
         self.assertEqual(decision["roi_percent"], -2.0)
         self.assertIn("Half buy", decision["reason"])
 
-    def test_roi_below_threshold_uses_full_configured_amount(self):
+    def test_ghostfolio_doge_roi_below_threshold_uses_full_configured_amount(self):
         with (
             patch.dict(
                 os.environ,
                 {"PORTFOLIO_ACCOUNT_MAP": json.dumps({"BTC": "btc-account"})},
                 clear=False,
             ),
-            patch.object(
-                portfolio_logger, "get_asset_roi_percent", return_value=-2.01
-            ),
+            patch.object(portfolio_logger, "get_asset_roi_percent", return_value=-15.43),
         ):
             decision = crypto_dca.determine_dynamic_dca_decision(
                 "BTC_THB", 800, {"ENABLED": True}
@@ -52,7 +50,7 @@ class DcaGhostfolioBoundaryTests(unittest.TestCase):
 
         self.assertEqual(decision["amount_thb"], 800)
         self.assertEqual(decision["multiplier"], 1.0)
-        self.assertEqual(decision["roi_percent"], -2.01)
+        self.assertEqual(decision["roi_percent"], -15.43)
         self.assertIn("below -2.00%", decision["reason"])
 
     def test_unavailable_roi_uses_full_configured_amount(self):

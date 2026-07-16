@@ -146,7 +146,7 @@ def resolve_ghostfolio_asset(symbol, exchange_pair=None):
 
 
 def get_asset_roi_percent(symbol, account_id, exchange_pair=None, bearer_token=None):
-    """Return an asset's lifetime net ROI percent in its mapped Ghostfolio account."""
+    """Return the Ghostfolio holdings-table ROI percent for an asset's mapped account."""
     if not GHOSTFOLIO_TOKEN and not bearer_token:
         print("⚠️ GHOSTFOLIO_TOKEN not set. Cannot fetch Ghostfolio asset ROI.")
         return None
@@ -206,15 +206,20 @@ def get_asset_roi_percent(symbol, account_id, exchange_pair=None, bearer_token=N
             )
             return None
 
-        roi_percent = matching_holdings[0].get(
-            "netPerformancePercentWithCurrencyEffect"
-        )
-        if isinstance(roi_percent, bool):
-            raise ValueError("ROI percent must be numeric")
+        holding = matching_holdings[0]
+        net_performance = holding.get("netPerformanceWithCurrencyEffect")
+        investment = holding.get("investment")
+        if isinstance(net_performance, bool) or isinstance(investment, bool):
+            raise ValueError("ROI values must be numeric")
 
-        roi_percent = float(roi_percent)
-        if not math.isfinite(roi_percent):
-            raise ValueError("ROI percent must be finite")
+        net_performance = float(net_performance)
+        investment = float(investment)
+        if not math.isfinite(net_performance) or not math.isfinite(investment):
+            raise ValueError("ROI values must be finite")
+        if investment <= 0:
+            raise ValueError("ROI investment must be greater than zero")
+
+        roi_percent = (net_performance / investment) * 100
 
         print(
             "   Ghostfolio asset ROI: "

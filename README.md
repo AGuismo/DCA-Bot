@@ -110,8 +110,8 @@ Go to `Settings` -> `Secrets and variables` -> `Actions` -> `New repository vari
 ### Dynamic DCA
 
 Set `DYNAMIC_DCA.ENABLED` to `true` for each asset that should use the policy.
-The bot reads that asset's lifetime, account-scoped Ghostfolio ROI (including
-currency effect) before placing the order:
+The bot reads the same lifetime, account-scoped ROI shown in Ghostfolio's
+holdings table before placing the order:
 
 - ROI at or above `THRESHOLD_PERCENT` (default `-2`) buys `AMOUNT * REDUCED_MULTIPLIER` (default `0.5`).
 - ROI below the threshold buys the configured `AMOUNT` at `x1`.

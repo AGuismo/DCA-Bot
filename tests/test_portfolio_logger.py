@@ -170,15 +170,17 @@ class GhostfolioAssetResolutionTests(unittest.TestCase):
         )
         self.assertIsNone(portfolio_logger.get_account_id("BTC", {}))
 
-    def test_asset_roi_uses_mapped_account_and_currency_effect_return(self):
+    def test_asset_roi_matches_ghostfolio_holdings_table_roi(self):
         response = MockResponse(
             200,
             {
                 "holdings": [
                     {
                         "dataSource": "YAHOO",
-                        "symbol": "BTCUSD",
-                        "netPerformancePercentWithCurrencyEffect": -1.75,
+                        "symbol": "DOGEUSD",
+                        "investment": 1178.16,
+                        "netPerformancePercentWithCurrencyEffect": -0.0037,
+                        "netPerformanceWithCurrencyEffect": -181.79,
                     }
                 ]
             },
@@ -192,10 +194,10 @@ class GhostfolioAssetResolutionTests(unittest.TestCase):
             patch.object(portfolio_logger.requests, "get", return_value=response) as get,
         ):
             roi_percent = portfolio_logger.get_asset_roi_percent(
-                "BTC", "btc-account", exchange_pair="BTC_THB"
+                "DOGE", "doge-account", exchange_pair="DOGE_THB"
             )
 
-        self.assertEqual(roi_percent, -1.75)
+        self.assertAlmostEqual(roi_percent, -15.43, places=2)
         authenticate.assert_called_once_with(
             portfolio_logger.GHOSTFOLIO_URL,
             "test-token",
@@ -205,16 +207,44 @@ class GhostfolioAssetResolutionTests(unittest.TestCase):
         self.assertEqual(
             get.call_args.kwargs["params"],
             {
-                "accounts": "btc-account",
+                "accounts": "doge-account",
                 "dataSource": "YAHOO",
                 "range": "max",
-                "symbol": "BTCUSD",
+                "symbol": "DOGEUSD",
             },
         )
         self.assertEqual(
             get.call_args.kwargs["timeout"],
             portfolio_logger.ROI_LOOKUP_TIMEOUT_SECONDS,
         )
+
+    def test_asset_roi_returns_none_for_non_positive_investment(self):
+        response = MockResponse(
+            200,
+            {
+                "holdings": [
+                    {
+                        "dataSource": "YAHOO",
+                        "symbol": "DOGEUSD",
+                        "investment": 0,
+                        "netPerformanceWithCurrencyEffect": -181.79,
+                    }
+                ]
+            },
+        )
+
+        with (
+            patch.object(portfolio_logger, "GHOSTFOLIO_TOKEN", "test-token"),
+            patch.object(
+                portfolio_logger, "authenticate_ghostfolio", return_value="jwt"
+            ),
+            patch.object(portfolio_logger.requests, "get", return_value=response),
+        ):
+            roi_percent = portfolio_logger.get_asset_roi_percent(
+                "DOGE", "doge-account", exchange_pair="DOGE_THB"
+            )
+
+        self.assertIsNone(roi_percent)
 
     def test_asset_roi_returns_none_for_missing_matching_holding(self):
         response = MockResponse(
