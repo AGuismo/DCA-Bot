@@ -55,6 +55,8 @@ ALLOWED_USERS = os.environ.get("DISCORD_ALLOWED_USERS", "")
 # DCA Scheduler — replaces external cron-job.org polling
 DCA_CRON_ENABLED = os.environ.get("DCA_CRON_ENABLED", "false").lower() == "true"
 TIMEZONE = ZoneInfo(os.environ.get("TIMEZONE", "Asia/Bangkok"))
+DCA_AMOUNT_MIN_THB = 50
+DCA_AMOUNT_MAX_THB = 2000
 
 
 # ---------------------------------------------------------------------------
@@ -91,7 +93,7 @@ Available actions:
      "doge" → "DOGE_THB", "dogecoin" → "DOGE_THB".
      Never output COIN/USDT, COIN_USDT, or a bare coin name like "BTC" — always append "_THB".
    - field: one of "TIME", "AMOUNT", "BUY_ENABLED"
-   - value: new value (HH:MM for TIME, number 10-1505 for AMOUNT, true/false for BUY_ENABLED)
+    - value: new value (HH:MM for TIME, number 50-2000 for AMOUNT, true/false for BUY_ENABLED)
    Note: "disable X" or "turn off X" means BUY_ENABLED=false; "enable X" or "turn on X" means BUY_ENABLED=true.
 
 4. "status" - Show current DCA configuration
@@ -497,12 +499,15 @@ async def handle_update_dca(params: dict, message: discord.Message):
     elif field == "AMOUNT":
         try:
             value = float(value)
-            if value < 10 or value > 1505:
+            if value < DCA_AMOUNT_MIN_THB or value > DCA_AMOUNT_MAX_THB:
                 raise ValueError("out of range")
             if value == int(value):
                 value = int(value)
         except (ValueError, TypeError):
-            await message.reply("❌ AMOUNT must be a number between 10 and 1505")
+            await message.reply(
+                f"❌ AMOUNT must be a number between {DCA_AMOUNT_MIN_THB} and "
+                f"{DCA_AMOUNT_MAX_THB}"
+            )
             return
 
     elif field == "BUY_ENABLED":
@@ -702,7 +707,7 @@ HELP_TEXT = """**🤖 DCA Bot — Natural Language Commands**
 • "Set BTC time to 22:00"
 • "Disable LINK" / "Enable BTC"
 • "Buy LINK now" / "Purchase SUI immediately"
-✅ AMOUNT range: 10–1505 THB per coin
+✅ AMOUNT range: 50–2000 THB per coin
 
 All commands are interpreted via AI — just type naturally!
 """

@@ -102,10 +102,23 @@ Go to `Settings` -> `Secrets and variables` -> `Actions` -> `New repository vari
 
 | Variable Name | Example Value | Description |
 | :--- | :--- | :--- |
-| `DCA_TARGET_MAP` | `{"BTC_THB": {"TIME": "07:00", "AMOUNT": 800, "BUY_ENABLED": true, "LAST_BUY_DATE": ""}}` | **Key config.** Dictionary mapping Symbol to settings (Time, Amount, Enabled, LastBuy). |
+| `DCA_TARGET_MAP` | `{"BTC_THB": {"TIME": "07:00", "AMOUNT": 800, "BUY_ENABLED": true, "LAST_BUY_DATE": "", "DYNAMIC_DCA": {"ENABLED": true, "THRESHOLD_PERCENT": -2, "REDUCED_MULTIPLIER": 0.5}}}` | **Key config.** Dictionary mapping Symbol to settings (time, amount, enabled state, last buy date, and optional dynamic DCA policy). |
 | `TIMEZONE` | `Asia/Bangkok` | Timezone for operations. |
 | `PORTFOLIO_ACCOUNT_MAP` | `{"BTC": "3cced5d3-f219-47c8-bb73-878466060d7a", "DEFAULT": "9069984b-3c2b-48d8-831d-b7d73b5bafb7"}` | Maps crypto symbols to Ghostfolio account IDs. Falls back to DEFAULT if symbol not found. |
 | `GHOSTFOLIO_URL` | `https://ghostfol.io` | Ghostfolio instance URL (optional, defaults to https://ghostfol.io). |
+
+### Dynamic DCA
+
+Set `DYNAMIC_DCA.ENABLED` to `true` for each asset that should use the policy.
+The bot reads that asset's lifetime, account-scoped Ghostfolio ROI (including
+currency effect) before placing the order:
+
+- ROI at or above `THRESHOLD_PERCENT` (default `-2`) buys `AMOUNT * REDUCED_MULTIPLIER` (default `0.5`).
+- ROI below the threshold buys the configured `AMOUNT` at `x1`.
+- Missing, invalid, or unavailable Ghostfolio ROI also buys the configured `AMOUNT` at `x1`.
+- If the reduced amount would be below Bitkub's 10 THB minimum, the bot buys the configured `AMOUNT` at `x1`.
+
+Every successful DCA Discord notification includes the asset ROI and the full- or half-buy reason.
 
 ### 3. Workflow Configuration
 
@@ -344,7 +357,7 @@ python discord_bot.py
 - **With `DISCORD_CHANNEL_ID` set**: Bot responds to all messages in that channel
 - **Without it**: Bot only responds to @mentions and DMs
 - **With `DISCORD_ALLOWED_USERS` set**: Only listed user IDs can trigger actions
-- **DCA updates are validated**: AMOUNT must be 20–1505 THB, TIME must be HH:MM, BUY_ENABLED must be bool. Cannot add/remove symbols — only update existing ones.
+- **DCA updates are validated**: AMOUNT must be 50–2000 THB, inclusive; TIME must be HH:MM; BUY_ENABLED must be bool. Cannot add/remove symbols — only update existing ones.
 
 ### Built-in DCA Scheduler
 When `DCA_CRON_ENABLED=true`, the bot replaces the need for an external cron service (e.g., cron-job.org) by dispatching `daily_dca.yml` at the right times:

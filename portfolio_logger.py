@@ -1,5 +1,6 @@
 import os
 import json
+import math
 import time
 import requests
 from datetime import datetime, timedelta, timezone as dt_timezone
@@ -25,6 +26,7 @@ AMBIGUOUS_SYMBOLS = {"HYPE"}
 IMPORT_RETRY_ATTEMPTS = 3
 IMPORT_RETRY_DELAY_SECONDS = 2
 RETRYABLE_IMPORT_STATUS_CODES = {408, 425, 429}
+ROI_LOOKUP_TIMEOUT_SECONDS = 10
 
 # Timezone Configuration
 TIMEZONE_NAME = os.environ.get("TIMEZONE", "Asia/Bangkok")
@@ -141,6 +143,97 @@ def resolve_ghostfolio_asset(symbol, exchange_pair=None):
         f"method={'explicit_mapping' if resolution['usedExplicitMapping'] else 'fallback'}"
     )
     return resolution
+
+
+def get_asset_roi_percent(symbol, account_id, exchange_pair=None, bearer_token=None):
+    """Return an asset's lifetime net ROI percent in its mapped Ghostfolio account."""
+    if not GHOSTFOLIO_TOKEN and not bearer_token:
+        print("⚠️ GHOSTFOLIO_TOKEN not set. Cannot fetch Ghostfolio asset ROI.")
+        return None
+
+    if not account_id:
+        print("⚠️ No account ID provided. Cannot fetch Ghostfolio asset ROI.")
+        return None
+
+    try:
+        if not bearer_token:
+            bearer_token = authenticate_ghostfolio(
+                GHOSTFOLIO_URL,
+                GHOSTFOLIO_TOKEN,
+                timeout=ROI_LOOKUP_TIMEOUT_SECONDS,
+                retries=1,
+            )
+            if not bearer_token:
+                return None
+
+        resolution = resolve_ghostfolio_asset(symbol, exchange_pair=exchange_pair)
+        response = requests.get(
+            f"{GHOSTFOLIO_URL}/api/v1/portfolio/holdings",
+            headers={"Authorization": f"Bearer {bearer_token}"},
+            params={
+                "accounts": account_id,
+                "dataSource": resolution["dataSource"],
+                "range": "max",
+                "symbol": resolution["symbol"],
+            },
+            timeout=ROI_LOOKUP_TIMEOUT_SECONDS,
+        )
+
+        if response.status_code != 200:
+            print(
+                "❌ Ghostfolio asset ROI lookup failed "
+                f"(HTTP {response.status_code}): "
+                f"{_safe_response_body(response, [f'Bearer {bearer_token}'])}"
+            )
+            return None
+
+        holdings = response.json().get("holdings")
+        if not isinstance(holdings, list):
+            print("❌ Ghostfolio asset ROI lookup returned an invalid holdings list.")
+            return None
+
+        matching_holdings = [
+            holding
+            for holding in holdings
+            if holding.get("dataSource") == resolution["dataSource"]
+            and holding.get("symbol") == resolution["symbol"]
+        ]
+        if len(matching_holdings) != 1:
+            print(
+                "⚠️ Ghostfolio asset ROI lookup returned "
+                f"{len(matching_holdings)} matching holdings for "
+                f"{resolution['dataSource']}/{resolution['symbol']}."
+            )
+            return None
+
+        roi_percent = matching_holdings[0].get(
+            "netPerformancePercentWithCurrencyEffect"
+        )
+        if isinstance(roi_percent, bool):
+            raise ValueError("ROI percent must be numeric")
+
+        roi_percent = float(roi_percent)
+        if not math.isfinite(roi_percent):
+            raise ValueError("ROI percent must be finite")
+
+        print(
+            "   Ghostfolio asset ROI: "
+            f"asset={resolution['dataSource']}/{resolution['symbol']}, "
+            f"roi={roi_percent:.2f}%"
+        )
+        return roi_percent
+    except (
+        requests.exceptions.Timeout,
+        requests.exceptions.ConnectionError,
+        requests.exceptions.SSLError,
+    ) as error:
+        print(f"⚠️ Ghostfolio asset ROI lookup request failed: {error}")
+    except (TypeError, ValueError) as error:
+        print(f"⚠️ Ghostfolio asset ROI lookup returned invalid data: {error}")
+    except Exception as error:
+        print(f"⚠️ Ghostfolio asset ROI lookup failed: {error}")
+
+    return None
 
 
 def build_ghostfolio_activity(trade_data, symbol, account_id, exchange_pair=None):

@@ -1,6 +1,7 @@
 import os
 import time
 import json
+import math
 import requests
 from datetime import datetime, timedelta
 from gist_logger import update_gist_log
@@ -13,8 +14,11 @@ from zoneinfo import ZoneInfo
 SELECTED_TZ = ZoneInfo(TIMEZONE_NAME)
 
 # Default settings (fallback)
-DEFAULT_DCA_AMOUNT = 20.0
+DEFAULT_DCA_AMOUNT = 50.0
 DEFAULT_TARGET_TIME = os.environ.get("DCA_TARGET_TIME", "07:00")
+DYNAMIC_DCA_DEFAULT_THRESHOLD_PERCENT = -2.0
+DYNAMIC_DCA_DEFAULT_REDUCED_MULTIPLIER = 0.5
+MINIMUM_DCA_AMOUNT_THB = 10.0
 
 # Target Map (JSON String)
 # Format: {"BTC_THB": {"TIME": "07:00", "AMOUNT": 800, "BUY_ENABLED": true, "LAST_BUY_DATE": ""}}
@@ -58,6 +62,7 @@ def get_config_for_symbol(symbol_thb, target_map):
         "AMOUNT": DEFAULT_DCA_AMOUNT, 
         "BUY_ENABLED": True,
         "LAST_BUY_DATE": None,
+        "DYNAMIC_DCA": None,
         "KEY": symbol_thb # Store the key used in map for updates later
     }
     
@@ -87,6 +92,7 @@ def get_config_for_symbol(symbol_thb, target_map):
             config["AMOUNT"] = float(found_entry.get("AMOUNT", DEFAULT_DCA_AMOUNT))
             config["BUY_ENABLED"] = found_entry.get("BUY_ENABLED", True)
             config["LAST_BUY_DATE"] = found_entry.get("LAST_BUY_DATE", None)
+            config["DYNAMIC_DCA"] = found_entry.get("DYNAMIC_DCA")
         else:
             # Old Format (String Time)
             config["TIME"] = str(found_entry)
@@ -95,6 +101,177 @@ def get_config_for_symbol(symbol_thb, target_map):
         print(f"⚠️ No config found for {symbol_thb}. Using defaults.")
 
     return config
+
+
+def get_dynamic_dca_settings(dynamic_dca):
+    """Return validated per-asset dynamic DCA settings."""
+    settings = {
+        "enabled": False,
+        "threshold_percent": DYNAMIC_DCA_DEFAULT_THRESHOLD_PERCENT,
+        "reduced_multiplier": DYNAMIC_DCA_DEFAULT_REDUCED_MULTIPLIER,
+        "error": None,
+    }
+
+    if dynamic_dca is None:
+        return settings
+
+    if not isinstance(dynamic_dca, dict):
+        settings["error"] = "DYNAMIC_DCA must be an object."
+        return settings
+
+    enabled = dynamic_dca.get("ENABLED", False)
+    if not isinstance(enabled, bool):
+        settings["error"] = "DYNAMIC_DCA.ENABLED must be true or false."
+        return settings
+
+    try:
+        threshold_percent = float(
+            dynamic_dca.get("THRESHOLD_PERCENT", DYNAMIC_DCA_DEFAULT_THRESHOLD_PERCENT)
+        )
+        reduced_multiplier = float(
+            dynamic_dca.get(
+                "REDUCED_MULTIPLIER", DYNAMIC_DCA_DEFAULT_REDUCED_MULTIPLIER
+            )
+        )
+    except (TypeError, ValueError):
+        settings["error"] = "DYNAMIC_DCA threshold and multiplier must be numeric."
+        return settings
+
+    if not math.isfinite(threshold_percent) or not math.isfinite(reduced_multiplier):
+        settings["error"] = "DYNAMIC_DCA threshold and multiplier must be finite."
+        return settings
+
+    if not 0 < reduced_multiplier <= 1:
+        settings["error"] = "DYNAMIC_DCA.REDUCED_MULTIPLIER must be above 0 and at most 1."
+        return settings
+
+    settings.update(
+        {
+            "enabled": enabled,
+            "threshold_percent": threshold_percent,
+            "reduced_multiplier": reduced_multiplier,
+        }
+    )
+    return settings
+
+
+def get_ghostfolio_account_id(symbol):
+    """Return the configured Ghostfolio account for an asset, if available."""
+    try:
+        from portfolio_logger import get_account_id
+
+        portfolio_map = json.loads(os.environ.get("PORTFOLIO_ACCOUNT_MAP", "{}"))
+        if not isinstance(portfolio_map, dict):
+            raise ValueError("PORTFOLIO_ACCOUNT_MAP must be a JSON object")
+        return get_account_id(symbol, portfolio_map)
+    except (json.JSONDecodeError, ValueError, TypeError) as error:
+        print(f"⚠️ Could not read PORTFOLIO_ACCOUNT_MAP: {error}")
+    except Exception as error:
+        print(f"⚠️ Could not resolve Ghostfolio account for {symbol}: {error}")
+
+    return None
+
+
+def _build_dca_decision(amount_thb, multiplier, roi_percent, reason):
+    return {
+        "amount_thb": amount_thb,
+        "multiplier": multiplier,
+        "roi_percent": roi_percent,
+        "reason": reason,
+    }
+
+
+def determine_dynamic_dca_decision(symbol, configured_amount, dynamic_dca):
+    """Choose a full or reduced DCA amount from the asset's Ghostfolio ROI."""
+    configured_amount = float(configured_amount)
+    settings = get_dynamic_dca_settings(dynamic_dca)
+
+    if settings["error"]:
+        return _build_dca_decision(
+            configured_amount,
+            1.0,
+            None,
+            f"Full buy (x1): {settings['error']}",
+        )
+
+    if not settings["enabled"]:
+        return _build_dca_decision(
+            configured_amount,
+            1.0,
+            None,
+            "Full buy (x1): Dynamic DCA is disabled.",
+        )
+
+    base_symbol = symbol.split("_")[0]
+    account_id = get_ghostfolio_account_id(base_symbol)
+    if not account_id:
+        return _build_dca_decision(
+            configured_amount,
+            1.0,
+            None,
+            "Full buy (x1): Ghostfolio ROI is unavailable; using the configured amount.",
+        )
+
+    try:
+        from portfolio_logger import get_asset_roi_percent
+
+        roi_percent = get_asset_roi_percent(
+            base_symbol, account_id, exchange_pair=symbol
+        )
+    except Exception as error:
+        print(f"⚠️ Ghostfolio asset ROI lookup failed for {symbol}: {error}")
+        roi_percent = None
+
+    if roi_percent is None:
+        return _build_dca_decision(
+            configured_amount,
+            1.0,
+            None,
+            "Full buy (x1): Ghostfolio ROI is unavailable; using the configured amount.",
+        )
+
+    if roi_percent >= settings["threshold_percent"]:
+        reduced_amount = round(
+            configured_amount * settings["reduced_multiplier"], 2
+        )
+        if reduced_amount >= MINIMUM_DCA_AMOUNT_THB:
+            return _build_dca_decision(
+                reduced_amount,
+                settings["reduced_multiplier"],
+                roi_percent,
+                (
+                    f"Half buy (x{settings['reduced_multiplier']:g}): asset ROI "
+                    f"{roi_percent:+.2f}% is at or above "
+                    f"{settings['threshold_percent']:.2f}%."
+                ),
+            )
+
+        return _build_dca_decision(
+            configured_amount,
+            1.0,
+            roi_percent,
+            (
+                "Full buy (x1): the reduced amount would be below the "
+                f"{MINIMUM_DCA_AMOUNT_THB:.0f} THB minimum."
+            ),
+        )
+
+    return _build_dca_decision(
+        configured_amount,
+        1.0,
+        roi_percent,
+        (
+            f"Full buy (x1): asset ROI {roi_percent:+.2f}% is below "
+            f"{settings['threshold_percent']:.2f}%."
+        ),
+    )
+
+
+def format_asset_roi(roi_percent):
+    """Format an asset ROI for a Discord trade notification."""
+    if roi_percent is None:
+        return "Unavailable"
+    return f"{roi_percent:+.2f}%"
 
 def is_time_to_trade(target_time_str):
     """
@@ -246,7 +423,17 @@ def save_last_buy_date(target_map, symbol_key, date_str):
     # Raise exception to fail the workflow loudly
     raise RuntimeError(f"Failed to update LAST_BUY_DATE after {max_retries} attempts: {last_error}")
 
-def execute_trade(symbol, amount_thb, map_key=None, target_map=None):
+def execute_trade(
+    symbol, amount_thb, map_key=None, target_map=None, dca_decision=None
+):
+    if dca_decision is None:
+        dca_decision = _build_dca_decision(
+            amount_thb,
+            1.0,
+            None,
+            "Full buy (x1): Dynamic DCA decision was not available.",
+        )
+
     # Mask the configured DCA amount so subsequent log lines are redacted in GitHub Actions
     _gha_mask(str(amount_thb))
     if float(amount_thb) == int(float(amount_thb)):
@@ -315,12 +502,9 @@ def execute_trade(symbol, amount_thb, map_key=None, target_map=None):
         # 5. Log to Ghostfolio
         ghostfolio_saved = False
         try:
-            from portfolio_logger import log_to_ghostfolio, get_account_id
+            from portfolio_logger import log_to_ghostfolio
             
-            portfolio_map_json = os.environ.get("PORTFOLIO_ACCOUNT_MAP", "{}")
-            portfolio_map = json.loads(portfolio_map_json)
-            
-            account_id = get_account_id(base_sym, portfolio_map)
+            account_id = get_ghostfolio_account_id(base_sym)
             
             if account_id:
                 ghostfolio_data = {
@@ -366,6 +550,8 @@ def execute_trade(symbol, amount_thb, map_key=None, target_map=None):
             f"📥 **Received:** {received_amt:.8f} {base_sym}\n"
             f"🏷️ **Rate:** ฿{rate:,.2f}\n"
             f"🏷️ **Rate (USD):** ${usd_price_per_unit:,.4f}\n"
+            f"📊 **Asset ROI:** {format_asset_roi(dca_decision.get('roi_percent'))}\n"
+            f"⚖️ **DCA Decision:** {dca_decision.get('reason')}\n"
             f"💾 **Portfolio:** {'✅ Saved' if ghostfolio_saved else '❌ Not saved'}\n"
             f"🕒 **Time:** {dt_str}\n"
             f"🆔 **Order ID:** {order_id}"
@@ -428,7 +614,7 @@ def main():
             continue
             
         target_time = config["TIME"]
-        trade_amount = config["AMOUNT"]
+        configured_amount = config["AMOUNT"]
         
         if is_time_to_trade(target_time):
             # Check LAST_BUY_DATE
@@ -438,8 +624,20 @@ def main():
             if last_buy == today_str:
                 print(f"🛑 Already bought {symbol} today ({today_str}). Skipping.")
             else:
-                print("✅ Time match & Not bought today! Executing trade.")
-                execute_trade(symbol, trade_amount, map_key=config["KEY"], target_map=target_map)
+                dca_decision = determine_dynamic_dca_decision(
+                    symbol, configured_amount, config["DYNAMIC_DCA"]
+                )
+                print(
+                    "✅ Time match & Not bought today! "
+                    f"{dca_decision['reason']}"
+                )
+                execute_trade(
+                    symbol,
+                    dca_decision["amount_thb"],
+                    map_key=config["KEY"],
+                    target_map=target_map,
+                    dca_decision=dca_decision,
+                )
         else:
             print(f"⏳ Not time yet (Target: {target_time}). Skipping.")
 

@@ -170,6 +170,95 @@ class GhostfolioAssetResolutionTests(unittest.TestCase):
         )
         self.assertIsNone(portfolio_logger.get_account_id("BTC", {}))
 
+    def test_asset_roi_uses_mapped_account_and_currency_effect_return(self):
+        response = MockResponse(
+            200,
+            {
+                "holdings": [
+                    {
+                        "dataSource": "YAHOO",
+                        "symbol": "BTCUSD",
+                        "netPerformancePercentWithCurrencyEffect": -1.75,
+                    }
+                ]
+            },
+        )
+
+        with (
+            patch.object(portfolio_logger, "GHOSTFOLIO_TOKEN", "test-token"),
+            patch.object(
+                portfolio_logger, "authenticate_ghostfolio", return_value="jwt"
+            ) as authenticate,
+            patch.object(portfolio_logger.requests, "get", return_value=response) as get,
+        ):
+            roi_percent = portfolio_logger.get_asset_roi_percent(
+                "BTC", "btc-account", exchange_pair="BTC_THB"
+            )
+
+        self.assertEqual(roi_percent, -1.75)
+        authenticate.assert_called_once_with(
+            portfolio_logger.GHOSTFOLIO_URL,
+            "test-token",
+            timeout=portfolio_logger.ROI_LOOKUP_TIMEOUT_SECONDS,
+            retries=1,
+        )
+        self.assertEqual(
+            get.call_args.kwargs["params"],
+            {
+                "accounts": "btc-account",
+                "dataSource": "YAHOO",
+                "range": "max",
+                "symbol": "BTCUSD",
+            },
+        )
+        self.assertEqual(
+            get.call_args.kwargs["timeout"],
+            portfolio_logger.ROI_LOOKUP_TIMEOUT_SECONDS,
+        )
+
+    def test_asset_roi_returns_none_for_missing_matching_holding(self):
+        response = MockResponse(
+            200,
+            {
+                "holdings": [
+                    {
+                        "dataSource": "YAHOO",
+                        "symbol": "ETHUSD",
+                        "netPerformancePercentWithCurrencyEffect": -10.0,
+                    }
+                ]
+            },
+        )
+
+        with (
+            patch.object(portfolio_logger, "GHOSTFOLIO_TOKEN", "test-token"),
+            patch.object(
+                portfolio_logger, "authenticate_ghostfolio", return_value="jwt"
+            ),
+            patch.object(portfolio_logger.requests, "get", return_value=response),
+        ):
+            roi_percent = portfolio_logger.get_asset_roi_percent(
+                "BTC", "btc-account", exchange_pair="BTC_THB"
+            )
+
+        self.assertIsNone(roi_percent)
+
+    def test_asset_roi_returns_none_for_failed_response(self):
+        response = MockResponse(503, {"message": "service unavailable"})
+
+        with (
+            patch.object(portfolio_logger, "GHOSTFOLIO_TOKEN", "test-token"),
+            patch.object(
+                portfolio_logger, "authenticate_ghostfolio", return_value="jwt"
+            ),
+            patch.object(portfolio_logger.requests, "get", return_value=response),
+        ):
+            roi_percent = portfolio_logger.get_asset_roi_percent(
+                "BTC", "btc-account", exchange_pair="BTC_THB"
+            )
+
+        self.assertIsNone(roi_percent)
+
     def test_transient_validation_rejection_retries_then_saves(self):
         validation_failure = MockResponse(
             400,
